@@ -4,96 +4,99 @@ import sys
 import random
 import time
 
-# --- 辅助显示工具 ---
-def get_tile_str(tid):
-    t_type = tid // 4
-    if 0 <= t_type <= 8: return f"{t_type + 1}m" # 万
-    if 9 <= t_type <= 17: return f"{t_type - 9 + 1}p" # 筒
-    if 18 <= t_type <= 26: return f"{t_type - 18 + 1}s" # 索
-    z_map = {27:'东', 28:'南', 29:'西', 30:'北', 31:'白', 32:'发', 33:'中'}
-    return z_map.get(t_type, '?')
+HOST = '127.0.0.1'
+PORT = 65432
 
-def get_action_str(aid):
-    if 0 <= aid < 136:
-        return f"切 {get_tile_str(aid)}"
-    return f"操作(ID:{aid})" 
-# ------------------
+class MahjongClient:
+    def __init__(self, mode="manual"):
+        self.mode = mode
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.player_id = -1
 
-def run_client(mode):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect(('127.0.0.1', 65432))
-        print(f"[*] 已连接服务端 | 模式: {mode}")
-    except:
-        print("[!] 连接失败，请先启动 server.py")
-        return
-
-    buffer = ""
-    while True:
+    def connect(self):
         try:
-            chunk = sock.recv(65536).decode('utf-8')
-            if not chunk: break
-            buffer += chunk
-            
-            if "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                data = json.loads(line)
-                
-                if data['type'] == 'game_over':
-                    print(f"\n=== GAME OVER ===\n得分: {data.get('rewards')}")
-                    break
-                
-                elif data['type'] == 'turn':
-                    # 解析数据
-                    raw_json = data['mjx_raw_json']
-                    legal_actions = data['legal_actions']
-                    state_obj = json.loads(raw_json)
-                    
-                    # 1. 简单渲染界面
-                    my_info = state_obj.get('privateInfos', [{}])[0]
-                    hand = sorted(my_info.get('hand', []))
-                    hand_str = " ".join([get_tile_str(t) for t in hand])
-                    
-                    print("\n" + "="*50)
-                    print(f"【Player 0 - {mode.upper()}】")
-                    print(f"手牌: [{hand_str}]")
-                    
-                    # 2. 原始 MJX 信息 (Requirement 5)
-                    wall_count = len(state_obj.get('hiddenState', {}).get('wall', []))
-                    dora_inds = state_obj.get('publicObservation', {}).get('doraInds', [])
-                    print(f"[MJX Info] Wall: {wall_count}, DoraInds: {dora_inds}")
-                    print("-" * 50)
-                    
-                    # 3. 决策
-                    chosen = None
-                    if mode == 'human':
-                        print("可行操作:")
-                        for idx, act in enumerate(legal_actions):
-                            print(f"  [{idx}] {get_action_str(act)} (ID: {act})")
-                        while True:
-                            try:
-                                i = int(input("请输入序号: "))
-                                if 0 <= i < len(legal_actions):
-                                    chosen = legal_actions[i]
-                                    break
-                            except: pass
-                    else:
-                        # Auto
-                        time.sleep(0.1)
-                        chosen = random.choice(legal_actions)
-                        print(f"[Auto] 执行: {get_action_str(chosen)}")
-                    
-                    sock.sendall(str(chosen).encode('utf-8'))
+            self.sock.connect((HOST, PORT))
+            # 接收 Server 的 Hello 包
+            data = self.read_json()
+            if data and data['type'] == 'hello':
+                self.player_id = data['player_id']
+                print(f"✅ 已连接服务器，我是玩家 P{self.player_id}，模式: [{self.mode.upper()}]")
+        except ConnectionRefusedError:
+            print("❌ 无法连接服务器，请确认 server.py 已启动")
+            sys.exit()
 
-        except KeyboardInterrupt:
-            break
+    def read_json(self):
+        """简单的按行读取 JSON"""
+        try:
+            data = self.sock.recv(4096).strip()
+            if not data: return None
+            # 处理粘包风险（简单处理：假设每次只有一条json）
+            return json.loads(data.decode())
         except Exception as e:
-            print(f"Error: {e}")
-            break
-    sock.close()
+            return None
+
+    def display_ascii_hand(self, hand, actions, info):
+        print("\n" + "="*40)
+        print(f"🎮 轮到你了 (P{self.player_id}) | {info}")
+        print(f"🀄 手牌: {' '.join(hand)}")
+        print("-" * 40)
+        print("可执行动作:")
+        for i, act in enumerate(actions):
+            print(f"  [{i}] {act}")
+        print("="*40)
+
+    def run(self):
+        self.connect()
+        
+        while True:
+            msg = self.read_json()
+            if not msg:
+                break
+            
+            if msg['type'] == 'game_over':
+                print("🏁 对局结束")
+                break
+            
+            if msg['type'] == 'turn':
+                # 是我的回合
+                hand = msg['hand']
+                actions = msg['actions']
+                
+                # === 决策逻辑 ===
+                choice = 0
+                
+                if self.mode == "manual":
+                    self.display_ascii_hand(hand, actions, msg['info'])
+                    while True:
+                        try:
+                            user_input = input(f"请输入动作编号 (0-{len(actions)-1}): ")
+                            choice = int(user_input)
+                            if 0 <= choice < len(actions):
+                                break
+                        except ValueError:
+                            pass
+                else:
+                    # === 自动模式 (AI) ===
+                    # 这里为了演示，我们使用 Random AI
+                    # 如果你想接入你的 AI，就在这里调用你的 model.predict()
+                    # 简单模拟思考时间
+                    print(f"[Auto] P{self.player_id} 正在思考...", end="\r")
+                    time.sleep(0.1) 
+                    choice = random.randint(0, len(actions) - 1)
+                    # 打印一下机器人的选择
+                    print(f"[Auto] P{self.player_id} 选择了: {actions[choice]}")
+
+                # 发送响应
+                resp = {"act_idx": choice}
+                self.sock.sendall(json.dumps(resp).encode())
+
+        self.sock.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2: 
-        print("Usage: python client.py [human|auto]")
-    else:
-        run_client(sys.argv[1])
+    # 使用方法: python client.py [auto/manual]
+    mode = "manual"
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+    
+    client = MahjongClient(mode=mode)
+    client.run()

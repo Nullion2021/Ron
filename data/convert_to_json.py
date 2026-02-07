@@ -42,163 +42,237 @@ def tenhou_tile_to_mjai(tile_id):
         return f"{tm - 27 + 1}z" # 字牌
 
 def parse_xml_to_json(file_path):
+    """解析天凤 XML 格式的麻将牌谱文件，转换为 JSON 格式
+    
+    Args:
+        file_path: 待解析的 .mjlog 文件路径
+    
+    Returns:
+        包含游戏事件列表的 JSON 数据，解析失败返回 None
+    """
     try:
-        # --- 1. 读取文件内容 ---
+        # --- 阶段1: 读取文件内容 ---
         content = None
         try:
-            # 以二进制模式读取，因为可能是 gzip 压缩文件
+            # 以二进制模式读取，因为文件可能是 gzip 压缩格式
+            # 天凤服务器传输时会压缩文件以减小体积
             with open(file_path, 'rb') as f:
                 raw_data = f.read()
-                # 检查文件头魔数 (Magic Number) 1f 8b 来判断是否为 gzip
+                
+                # 检查文件头魔数 (Magic Number) 来判断文件类型
+                # gzip 格式的标准魔数为 0x1f 0x8b
                 if raw_data.startswith(b'\x1f\x8b'):
+                    # 如果是压缩文件，先解压再解码为 UTF-8 文本
                     content = gzip.decompress(raw_data).decode('utf-8')
                 else:
-                    # 如果不是压缩文件，直接解码文本
+                    # 如果不是压缩文件，直接将字节数据解码为 UTF-8 文本
                     content = raw_data.decode('utf-8')
         except Exception as e:
+            # 文件读取失败，打印错误信息并返回 None
             print(f"读取文件失败: {file_path}, {e}")
             return None
 
-        # --- 2. 解析 XML ---
+        # --- 阶段2: 解析 XML 结构 ---
         try:
-            # 将字符串转换为 XML 树结构
+            # 将 XML 字符串解析为 ElementTree 树结构
+            # 便于后续遍历和提取数据
             root = ET.fromstring(content)
         except ET.ParseError:
+            # XML 格式错误，返回 None
             return None
 
+        # 初始化游戏日志列表，用于存储所有解析出的游戏事件
         game_log = []
         
-        # --- 3. 遍历 XML 节点 (事件流) ---
-        # 天凤的 XML 是扁平的，每一个子节点代表一个动作
+        # --- 阶段3: 遍历 XML 节点，解析事件流 ---
+        # 天凤的 XML 采用扁平化结构，每个子节点代表一个游戏动作
+        # 例如: <INIT>, <T12>, <D30>, <N>, <REACH> 等
         for child in root:
-            tag = child.tag      # 标签名 (如 INIT, T12, D30)
-            attrs = child.attrib # 属性 (如 seed="...", hai0="...")
+            # 提取节点的标签名和属性
+            tag = child.tag      # 标签名 (如 INIT, T12, D30, N, REACH)
+            attrs = child.attrib # 属性字典 (如 seed="...", hai0="...")
             
+            # 初始化当前事件字典
             event = {}
             
-            # === 事件类型：一局开始 (INIT) ===
+            # ==========================================
+            # 事件类型1: 一局开始 (INIT)
+            # ==========================================
             if tag == 'INIT':
-                # seed 格式: "局数,本场,供托,骰子1,骰子2,宝牌指示牌ID"
+                # seed 属性格式: "局数,本场,供托,骰子1,骰子2,宝牌指示牌ID"
+                # 例如: "4,0,0,2,4,16" 表示南一局，0本场，0供托，骰子2和4，宝牌指示牌ID为16
                 seed = [int(x) for x in attrs['seed'].split(',')]
                 
                 # 计算场风 (Prevalent Wind)
-                # 局数 0-3: 东场, 4-7: 南场, 8-11: 西场
+                # 天凤用数字表示局数，每4局换一次场风：
+                # 局数 0-3: 东场 (East)
+                # 局数 4-7: 南场 (South)
+                # 局数 8-11: 西场 (West)
+                # 局数 12-15: 北场 (North)
                 round_idx = seed[0] // 4
-                winds = ['E', 'S', 'W', 'N'] # 东, 南, 西, 北
+                winds = ['E', 'S', 'W', 'N']  # 东, 南, 西, 北
                 bakaze = winds[round_idx % 4]
                 
+                # 构造一局开始事件
                 event = {
-                    "type": "start_kyoku",
-                    "bakaze": bakaze,             # 场风
+                    "type": "start_kyoku",      # 事件类型
+                    "bakaze": bakaze,             # 场风 (E/S/W/N)
                     "kyoku": (seed[0] % 4) + 1,   # 第几局 (1-4)
-                    "honba": seed[1],             # 本场数
-                    "kyotaku": seed[2],           # 供托(立直棒)数量
+                    "honba": seed[1],             # 本场数 (连庄次数)
+                    "kyotaku": seed[2],           # 供托/立直棒数量
                     "dora_marker": tenhou_tile_to_mjai(seed[5]), # 宝牌指示牌
-                    "tehais": [] # [重要新增] 初始手牌
+                    "tehais": []                  # 四位玩家的初始手牌
                 }
                 
-                # [新增] 解析四位玩家的初始手牌 (hai0, hai1, hai2, hai3)
+                # 解析四位玩家的初始手牌
+                # 属性名格式: hai0, hai1, hai2, hai3 (分别对应东、南、西、北家)
+                # 值格式: "11,22,33,44..." 的逗号分隔字符串
                 for i in range(4):
                     hai_str = attrs.get(f'hai{i}')
                     if hai_str:
-                        # 将 "11,22,33..." 这种字符串转为牌的代码列表
+                        # 将牌ID字符串转换为牌的代码列表
+                        # tenhou_tile_to_mjai 函数将天凤的牌ID转换为标准麻将牌码
                         tiles = [tenhou_tile_to_mjai(int(t)) for t in hai_str.split(',')]
                         event['tehais'].append(tiles)
                     else:
-                        event['tehais'].append([]) # 这一局可能少人?
+                        # 如果该位置没有手牌数据（可能是三人对局或断线），添加空列表
+                        event['tehais'].append([])
                 
-            # === 事件类型：鸣牌 (N) ===
+            # ==========================================
+            # 事件类型2: 鸣牌 (N) - 吃、碰、大明杠
+            # ==========================================
             elif tag == 'N':
-                # N 标签代表吃、碰、杠。
-                # 'who': 谁鸣牌 (0-3)
-                # 'm': 这是一个复杂的位掩码(Bitmask)，包含吃了哪张牌、从谁那里吃的。
-                # 暂时保留原始 m 值，完全解码需要复杂的位运算逻辑。
+                # N 标签表示玩家进行副露（鸣牌）操作
+                # 属性说明:
+                #   who: 进行鸣牌的玩家ID (0-3，分别代表东、南、西、北家)
+                #   m: 位掩码，编码了详细的鸣牌信息
+                #      包含: 吃了哪张牌、从谁那里吃的、吃的方式（左/中/右碰）等
+                #      由于位运算逻辑复杂，这里暂不详细解码，保留原始值
                 event = {
-                    "type": "naki", 
-                    "who": int(attrs.get('who')), 
-                    "raw_m": attrs.get('m')
+                    "type": "naki",               # 事件类型
+                    "who": int(attrs.get('who')), # 鸣牌玩家ID
+                    "raw_m": attrs.get('m')       # 原始位掩码值
                 }
                 
-            # === 事件类型：立直 (REACH) ===
+            # ==========================================
+            # 事件类型3: 立直 (REACH)
+            # ==========================================
             elif tag == 'REACH':
-                # 立直分两步：
-                # step=1: 玩家宣言立直 (紧接着会切出一张牌)
-                # step=2: 玩家放上点棒 (立直成立)
+                # 立直操作分为两个步骤，对应两个事件:
+                # step="1": 玩家宣言立直（喊"立直"），紧接着会切出一张牌
+                # step="2": 玩家放上1000点立直棒，立直正式成立
                 event = {
-                    "type": "reach", 
-                    "who": int(attrs.get('who')), 
-                    "step": attrs.get('step')
+                    "type": "reach",               # 事件类型
+                    "who": int(attrs.get('who')),  # 立直玩家ID
+                    "step": attrs.get('step')      # 立直步骤 ("1" 或 "2")
                 }
                 
-            # === 事件类型：和牌/结束 (AGARI) ===
+            # ==========================================
+            # 事件类型4: 和牌/游戏结束 (AGARI)
+            # ==========================================
             elif tag == 'AGARI':
-                # 包含谁胡了(who)、胡了谁(fromWho)、分值(ten)等信息
-                # 这里简单标记为和牌
+                # AGARI 表示玩家和牌，包含详细和牌信息:
+                #   who: 和牌玩家ID
+                #   fromWho: 放铳玩家ID (-1 表示自摸)
+                #   ten: 和牌点数
+                #   yaku: 役种列表
+                #   doraHai: 宝牌列表
+                #   machi: 待牌形状（边张、嵌张、双碰等）
+                # 当前版本只标记为和牌事件，暂不解析详细信息
                 event = {"type": "hora"} 
 
-            # === 事件类型：流局 (RYUUKYOKU) ===
+            # ==========================================
+            # 事件类型5: 流局 (RYUUKYOKU)
+            # ==========================================
             elif tag == 'RYUUKYOKU':
+                # RYUUKYOKU 表示流局（无人和牌）
+                # 可能包含原因，如: "nm" (荒牌流局), "k" (九种九牌), "r" (四风连打) 等
                 event = {"type": "ryukyoku"}
                 
-            # === 事件类型：摸牌/切牌 (T/D/U/E...) ===
-            # 天凤用首字母表示玩家动作：
-            # T, D -> 玩家0 (东家) 的 摸牌(Tsumo) / 切牌(Dahai)
-            # U, E -> 玩家1 (南家)
-            # V, F -> 玩家2 (西家)
-            # W, G -> 玩家3 (北家)
-            # 后面跟的数字是牌的ID
+            # ==========================================
+            # 事件类型6: 摸牌/切牌 (T/D/U/E/V/F/W/G)
+            # ==========================================
+            # 天凤使用单字母编码来表示玩家的摸牌和切牌动作:
+            #   玩家0 (东家): T(摸牌), D(切牌)
+            #   玩家1 (南家): U(摸牌), E(切牌)
+            #   玩家2 (西家): V(摸牌), F(切牌)
+            #   玩家3 (北家): W(摸牌), G(切牌)
+            # 字母后的数字表示牌的ID (天凤内部编码)
+            # 例如: T12 表示东家摸到ID为12的牌
             elif len(tag) > 1 and tag[0] in ['T', 'D', 'U', 'E', 'V', 'F', 'W', 'G'] and tag[1:].isdigit():
-                # 判断是摸牌还是切牌
+                # 判断动作类型: 首字母在 T/U/V/W 中表示摸牌，否则为切牌
                 action_type = "tsumo" if tag[0] in ['T','U','V','W'] else "dahai"
                 
-                # 映射字母到玩家 ID
+                # 建立字母到玩家ID的映射关系
                 player_map = {
-                    'T':0, 'D':0, 
-                    'U':1, 'E':1, 
-                    'V':2, 'F':2, 
-                    'W':3, 'G':3
+                    'T':0, 'D':0,  # 玩家0 (东家)
+                    'U':1, 'E':1,  # 玩家1 (南家)
+                    'V':2, 'F':2,  # 玩家2 (西家)
+                    'W':3, 'G':3   # 玩家3 (北家)
                 }
+                # 提取玩家ID和牌ID
                 player_id = player_map[tag[0]]
                 tile_id = int(tag[1:])
                 
+                # 构造摸牌或切牌事件
                 event = {
-                    "type": action_type,
-                    "actor": player_id,
-                    "pai": tenhou_tile_to_mjai(tile_id)
+                    "type": action_type,                 # "tsumo" 或 "dahai"
+                    "actor": player_id,                  # 执行动作的玩家ID
+                    "pai": tenhou_tile_to_mjai(tile_id)  # 转换后的牌码
                 }
             
-            # 如果解析出了有效事件，加入列表
+            # 如果成功解析出事件，将其添加到游戏日志列表中
             if event:
                 game_log.append(event)
                 
+        # 返回完整的游戏事件日志
         return game_log
 
     except Exception as e:
+        # 捕获解析过程中的任何异常，打印错误信息并返回 None
         print(f"解析异常 {file_path}: {e}")
         return None
 
 def main():
+    # 设置必要的目录结构
     setup_dir()
+    
+    # 查找所有待转换的 .mjlog 文件
+    # glob.glob 返回匹配指定路径模式的文件路径列表
     files = glob.glob(os.path.join(RAW_DIR, "*.mjlog"))
+    
+    # 输出待转换文件总数
     print(f"开始转换 {len(files)} 个文件...")
     
+    # 初始化计数器，记录已成功转换的文件数量
     count = 0
+    
+    # 遍历所有待转换的文件
     for fpath in files:
+        # 调用解析函数，将 XML 格式的 mjlog 文件转换为 JSON 数据结构
         json_data = parse_xml_to_json(fpath)
         
+        # 只有当解析成功时才进行保存操作
         if json_data:
-            # 保存为 .json
-            # separators=(',', ':') 可以去掉 json 中的空格，减小文件体积
+            # 构造输出文件名：将原文件的 .mjlog 扩展名替换为 .json
             fname = os.path.basename(fpath).replace('.mjlog', '.json')
+            # 构造完整的输出文件路径
             save_path = os.path.join(JSON_DIR, fname)
             
+            # 将 JSON 数据写入文件
+            # encoding='utf-8': 指定文件编码为 UTF-8，确保中文字符正确存储
+            # separators=(',', ':'): 去除 JSON 字符串中的空格和换行，减小文件体积
             with open(save_path, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, separators=(',', ':')) 
             
+            # 成功转换一个文件后计数器加 1
             count += 1
+            
+            # 每转换 10 个文件输出一次进度，避免频繁输出影响性能
             if count % 10 == 0:
                 print(f"已转换 {count} 个文件")
 
+    # 输出转换完成信息及文件保存位置
     print(f"转换完成！JSON文件保存在: {JSON_DIR}")
 
 if __name__ == "__main__":
